@@ -21,12 +21,96 @@ from .gimmvfi.utils.flow_viz import flow_to_image
 from .gimmvfi.utils.utils import InputPadder, RaftArgs, easydict_to_dict
 
 from contextlib import nullcontext
+import math
 
 import logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 log = logging.getLogger(__name__)
 
 script_directory = os.path.dirname(os.path.abspath(__file__))
+
+
+# Tiling helper functions for high-resolution processing
+def compute_grid_indices(image_shape, tile_size, min_overlap=20):
+    """
+    Compute tile positions for processing large images.
+
+    Args:
+        image_shape: (H, W) tuple of the image dimensions
+        tile_size: Size of each tile (can be int or tuple)
+        min_overlap: Minimum overlap between adjacent tiles in pixels
+
+    Returns:
+        List of (h, w) tuples representing top-left corner of each tile
+    """
+    if isinstance(tile_size, int):
+        tile_size = (tile_size, tile_size)
+
+    if min_overlap >= tile_size[0] or min_overlap >= tile_size[1]:
+        raise ValueError(f"Overlap {min_overlap} must be less than tile size {tile_size}")
+
+    # Generate tile positions
+    hs = list(range(0, image_shape[0], tile_size[0] - min_overlap))
+    ws = list(range(0, image_shape[1], tile_size[1] - min_overlap))
+
+    # Make sure the final tiles are flush with the image boundary
+    if len(hs) > 1:
+        hs[-1] = max(0, image_shape[0] - tile_size[0])
+    if len(ws) > 1:
+        ws[-1] = max(0, image_shape[1] - tile_size[1])
+
+    return [(h, w) for h in hs for w in ws]
+
+
+def compute_weight(hws, image_shape, tile_size, sigma=1.0, device='cuda'):
+    """
+    Compute Gaussian weights for blending overlapping tiles.
+
+    Args:
+        hws: List of (h, w) tile positions from compute_grid_indices
+        image_shape: (H, W) tuple of the image dimensions
+        tile_size: Size of each tile (can be int or tuple)
+        sigma: Gaussian sigma for weight computation
+        device: Device to create tensors on
+
+    Returns:
+        List of weight tensors, one for each tile
+    """
+    if isinstance(tile_size, int):
+        tile_size = (tile_size, tile_size)
+
+    patch_num = len(hws)
+
+    # Create meshgrid for tile
+    h, w = torch.meshgrid(
+        torch.arange(tile_size[0], device=device),
+        torch.arange(tile_size[1], device=device),
+        indexing='ij'
+    )
+    h, w = h.float() / float(tile_size[0]), w.float() / float(tile_size[1])
+
+    # Center at 0.5, 0.5
+    c_h, c_w = 0.5, 0.5
+    h, w = h - c_h, w - c_w
+
+    # Compute Gaussian weights (higher in center, lower at edges)
+    weights_hw = (h**2 + w**2) ** 0.5 / sigma
+    denorm = 1 / (sigma * math.sqrt(2 * math.pi))
+    weights_hw = denorm * torch.exp(-0.5 * (weights_hw) ** 2)
+
+    # Create weight map for full image
+    weights = torch.zeros(1, patch_num, *image_shape, device=device)
+    for idx, (h_pos, w_pos) in enumerate(hws):
+        weights[:, idx, h_pos:h_pos + tile_size[0], w_pos:w_pos + tile_size[1]] = weights_hw
+
+    # Extract per-tile weights
+    patch_weights = []
+    for idx, (h_pos, w_pos) in enumerate(hws):
+        patch_weights.append(
+            weights[:, idx:idx + 1, h_pos:h_pos + tile_size[0], w_pos:w_pos + tile_size[1]]
+        )
+
+    return patch_weights
 
 
 class DownloadAndLoadGIMMVFIModel:
@@ -147,6 +231,10 @@ class GIMMVFI_interpolate:
             },
             "optional": {
                 "output_flows": ("BOOLEAN", {"default": False, "tooltip": "Output the flow tensors"}),
+                "enable_tiling": ("BOOLEAN", {"default": False, "tooltip": "Enable tiling for high-resolution processing (required for 8K+)"}),
+                "tile_size": ("INT", {"default": 512, "min": 256, "max": 2048, "step": 64, "tooltip": "Size of each tile (larger = faster but more memory)"}),
+                "tile_overlap": ("INT", {"default": 64, "min": 20, "max": 256, "step": 4, "tooltip": "Overlap between tiles for seamless blending"}),
+                "blend_sigma": ("FLOAT", {"default": 1.0, "min": 0.1, "max": 2.0, "step": 0.1, "tooltip": "Gaussian sigma for tile blending (higher = smoother)"}),
             },
         }
 
@@ -155,7 +243,9 @@ class GIMMVFI_interpolate:
     FUNCTION = "interpolate"
     CATEGORY = "PyramidFlowWrapper"
 
-    def interpolate(self, gimmvfi_model, images, ds_factor, interpolation_factor,seed, output_flows=False):
+    def interpolate(self, gimmvfi_model, images, ds_factor, interpolation_factor, seed,
+                   output_flows=False, enable_tiling=False, tile_size=512,
+                   tile_overlap=64, blend_sigma=1.0):
         mm.soft_empty_cache()
         images = images.permute(0, 3, 1, 2)
         torch.manual_seed(seed)
@@ -182,36 +272,120 @@ class GIMMVFI_interpolate:
                 I2 = images[j+1].unsqueeze(0)
 
                 if j == start:
-                    out_images_list.append(I0.squeeze(0).permute(1, 2, 0))            
-                
+                    out_images_list.append(I0.squeeze(0).permute(1, 2, 0))
+
                 padder = InputPadder(I0.shape, 32)
-                I0, I2 = padder.pad(I0, I2)
-                xs = torch.cat((I0.unsqueeze(2), I2.unsqueeze(2)), dim=2).to(device, non_blocking=True)
-                
-                batch_size = xs.shape[0]
-                s_shape = xs.shape[-2:]
-            
-                coord_inputs = [
-                    (
-                        gimmvfi_model.sample_coord_input(
-                            batch_size,
-                            s_shape,
-                            [1 / interpolation_factor * i],
-                            device=xs.device,
-                            upsample_ratio=ds_factor,
-                        ),
-                        None,
-                    )
-                    for i in range(1, interpolation_factor)
-                ]
-                timesteps = [
-                    i * 1 / interpolation_factor * torch.ones(xs.shape[0]).to(xs.device)#.to(torch.float)
-                    for i in range(1, interpolation_factor)
-                ]
-                
-                all_outputs = gimmvfi_model(xs, coord_inputs, t=timesteps, ds_factor=ds_factor)
-                out_frames = [padder.unpad(im) for im in all_outputs["imgt_pred"]]
-                out_flowts = [padder.unpad(f) for f in all_outputs["flowt"]]
+                I0_padded, I2_padded = padder.pad(I0, I2)
+
+                if not enable_tiling:
+                    # Original full-frame processing
+                    xs = torch.cat((I0_padded.unsqueeze(2), I2_padded.unsqueeze(2)), dim=2).to(device, non_blocking=True)
+
+                    batch_size = xs.shape[0]
+                    s_shape = xs.shape[-2:]
+
+                    coord_inputs = [
+                        (
+                            gimmvfi_model.sample_coord_input(
+                                batch_size,
+                                s_shape,
+                                [1 / interpolation_factor * i],
+                                device=xs.device,
+                                upsample_ratio=ds_factor,
+                            ),
+                            None,
+                        )
+                        for i in range(1, interpolation_factor)
+                    ]
+                    timesteps = [
+                        i * 1 / interpolation_factor * torch.ones(xs.shape[0]).to(xs.device)
+                        for i in range(1, interpolation_factor)
+                    ]
+
+                    all_outputs = gimmvfi_model(xs, coord_inputs, t=timesteps, ds_factor=ds_factor)
+                    out_frames = [padder.unpad(im) for im in all_outputs["imgt_pred"]]
+                    out_flowts = [padder.unpad(f) for f in all_outputs["flowt"]]
+                else:
+                    # Tile-based processing for high resolution
+                    log.info(f"Processing frame pair {j+1}/{end} with tiling: tile_size={tile_size}, overlap={tile_overlap}")
+
+                    # Get padded image shape
+                    padded_shape = I0_padded.shape[-2:]  # (H, W)
+
+                    # Compute tile positions and Gaussian weights
+                    tile_positions = compute_grid_indices(padded_shape, tile_size, tile_overlap)
+                    tile_weights = compute_weight(tile_positions, padded_shape, tile_size,
+                                                 sigma=blend_sigma, device=device)
+
+                    log.info(f"Image size: {padded_shape}, Number of tiles: {len(tile_positions)}")
+
+                    # Process each interpolation timestep separately
+                    out_frames = []
+                    out_flowts = []
+
+                    for timestep_idx in range(1, interpolation_factor):
+                        t_value = timestep_idx / interpolation_factor
+
+                        # Initialize accumulators for this timestep
+                        accumulated_frame = torch.zeros_like(I0_padded)
+                        accumulated_flow = torch.zeros(I0_padded.shape[0], 2, *padded_shape,
+                                                      device=device, dtype=dtype)
+                        weight_sum = torch.zeros(I0_padded.shape[0], 1, *padded_shape,
+                                                device=device, dtype=dtype)
+
+                        # Process each tile
+                        for tile_idx, (h, w) in enumerate(tile_positions):
+                            h_end = min(h + tile_size, padded_shape[0])
+                            w_end = min(w + tile_size, padded_shape[1])
+
+                            # Extract tile from both frames
+                            I0_tile = I0_padded[:, :, h:h_end, w:w_end]
+                            I2_tile = I2_padded[:, :, h:h_end, w:w_end]
+
+                            # Create input for model
+                            xs_tile = torch.cat((I0_tile.unsqueeze(2), I2_tile.unsqueeze(2)), dim=2).to(device, non_blocking=True)
+
+                            batch_size = xs_tile.shape[0]
+                            tile_shape = xs_tile.shape[-2:]
+
+                            # Create coordinate input for this tile and timestep
+                            coord_input = (
+                                gimmvfi_model.sample_coord_input(
+                                    batch_size,
+                                    tile_shape,
+                                    [t_value],
+                                    device=xs_tile.device,
+                                    upsample_ratio=ds_factor,
+                                ),
+                                None,
+                            )
+
+                            timestep = t_value * torch.ones(xs_tile.shape[0]).to(xs_tile.device)
+
+                            # Run model on tile
+                            tile_outputs = gimmvfi_model(xs_tile, [coord_input], t=[timestep], ds_factor=ds_factor)
+
+                            # Get tile output
+                            tile_frame = tile_outputs["imgt_pred"][0]
+                            tile_flow = tile_outputs["flowt"][0]
+
+                            # Get weight for this tile
+                            tile_weight = tile_weights[tile_idx]
+
+                            # Accumulate weighted results
+                            actual_h = h_end - h
+                            actual_w = w_end - w
+                            accumulated_frame[:, :, h:h_end, w:w_end] += tile_frame[:, :, :actual_h, :actual_w] * tile_weight[:, :, :actual_h, :actual_w]
+                            accumulated_flow[:, :, h:h_end, w:w_end] += tile_flow[:, :, :actual_h, :actual_w] * tile_weight[:, :, :actual_h, :actual_w]
+                            weight_sum[:, :, h:h_end, w:w_end] += tile_weight[:, :, :actual_h, :actual_w]
+
+                        # Normalize by weight sum
+                        accumulated_frame = accumulated_frame / (weight_sum + 1e-8)
+                        accumulated_flow = accumulated_flow / (weight_sum + 1e-8)
+
+                        # Unpad and store
+                        out_frames.append(padder.unpad(accumulated_frame))
+                        out_flowts.append(padder.unpad(accumulated_flow))
 
                 if output_flows:
                     flowt_imgs = [
@@ -232,7 +406,7 @@ class GIMMVFI_interpolate:
                         flows.append(flowt_imgs[i])
 
                 out_images_list.append(
-                    ((padder.unpad(I2)).squeeze().detach().cpu().permute(1, 2, 0))
+                    ((padder.unpad(I2_padded)).squeeze().detach().cpu().permute(1, 2, 0))
                 )
                 pbar.update(1)
         
